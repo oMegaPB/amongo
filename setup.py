@@ -1,3 +1,7 @@
 from setuptools import setup
 
-setup(install_requires=["pymongo", "attrs"])
+setup(
+    name="amongo",
+    version="0.3.2",
+    install_requires=["pymongo", "attrs"]
+)
