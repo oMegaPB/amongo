@@ -1,5 +1,5 @@
 amongo is tiny mongodb driver only for local mongod for my own purposes. if you want you can modify it and use in any way. works well for highly loaded projects
-<code>
+```py
 import asyncio
 
 from amongo import AuthCredentials, AsyncMongo
@@ -12,4 +12,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-</code>
+```
