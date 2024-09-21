@@ -15,7 +15,7 @@ from typing import (
 )
 from collections.abc import Mapping
 
-from attrs import define
+from attrs import define, field
 import bson # bson dependency from pymongo. pip install pymongo
 from bson.codec_options import DEFAULT_CODEC_OPTIONS
 from bson import ObjectId
@@ -27,33 +27,42 @@ from .datatypes import Int32, Char
 
 @define
 class Serializer:
-    def _randint(self) -> int:
+    def _randint(self) -> int: # request_id must be any integer
         return int.from_bytes(os.urandom(4), signed=True)
 
-    def _pack_message(self, op: int, data: bytes) -> tuple[int, bytes]:
+    def _pack_message(self, op: int, message: bytes) -> tuple[int, bytes]:
+        # https://www.mongodb.com/docs/manual/reference/mongodb-wire-protocol/#standard-message-header
         rid = self._randint()
-        header = b"".join(map(Int32, [16 + len(data), rid, 0, op]))
-        return rid, header + data
+        packed = b"".join(map(Int32, [ 
+            16 + len(message), # length
+            rid, # request_id
+            0, # response to set to 0
+            op
+        ])) + message # doc itself
+        return rid, packed
 
     def _query_impl(self, doc: Document) -> bytes:
+        # https://www.mongodb.com/docs/manual/legacy-opcodes/#op_query
         encoded = bson.encode(doc, check_keys=False, codec_options=DEFAULT_CODEC_OPTIONS)
         return b"".join([
-            Int32(0),
-            bson._make_c_string("admin.$cmd"),
-            Int32(0),
-            Int32(-1),
-            encoded,
+            Int32(0), # flags
+            bson._make_c_string("admin.$cmd"), # collection name
+            Int32(0), # to_skip
+            Int32(-1), # to_return (all)
+            encoded, # doc itself
         ])
 
-    def _op_msg_no_header(
+    def _op_msg_impl(
         self,
         command: Mapping[str, Any]
     ) -> bytes:
+        # https://www.mongodb.com/docs/manual/reference/mongodb-wire-protocol/#op_msg
+        # https://www.mongodb.com/docs/manual/reference/mongodb-wire-protocol/#kind-0--body
         encoded = bson.encode(command, False, DEFAULT_CODEC_OPTIONS)
         return b"".join([
-            Int32(0), 
-            Char(0, signed=False), 
-            encoded
+            Int32(0), # flags
+            Char(0, signed=False), # section id 0 corresponds to single bson object
+            encoded # doc itself
         ])
 
     def get_reply(
@@ -61,8 +70,14 @@ class Serializer:
         msg: bytes, 
         op_code: int,
     ) -> xJsonT:
-        # flags, ptype, psize = struct.unpack_from("<IBi", msg)
-        message = msg[5:] if op_code != 1 else msg[20:]
+        if op_code == 1: # # https://www.mongodb.com/docs/manual/legacy-opcodes/#op_reply
+            # flags, cursor, starting, docs = struct.unpack_from("<iqii", msg) # size 20
+            message = msg[20:]
+        elif op_code == 2013: # https://www.mongodb.com/docs/manual/reference/mongodb-wire-protocol/#op_msg
+            # flags, section = struct.unpack_from("<IB", msg) # size 5
+            message = msg[5:]
+        else:
+            raise Exception(f"Unsupported op_code: {op_code}")
         return bson._decode_all_selective(message, codec_options=DEFAULT_CODEC_OPTIONS, fields=None)[0]
 
     def get_message(
@@ -70,20 +85,25 @@ class Serializer:
         doc: Document, 
         op: OP_T = 2013
     ) -> tuple[int, bytes]:
-        func = {2013: self._op_msg_no_header, 2004: self._query_impl}[op]
+        func = {
+            2013: self._op_msg_impl, 
+            2004: self._query_impl
+        }[op]
         return self._pack_message(op, func(doc))
 
     def verify_rid(self, data: bytes, rid: int) -> tuple[int, int]:
-        length, _, response_to, op_code = struct.unpack("<iiii", data) # _ is response id
-        assert response_to == rid, f"wrong response id {response_to} (should be {rid})"
+        # https://www.mongodb.com/docs/manual/reference/mongodb-wire-protocol/#standard-message-header
+        length, request_id, response_to, op_code = struct.unpack("<iiii", data)
+        if response_to != rid:
+            raise Exception(f"wrong response id. expected ({rid}) but found ({response_to})")
         return length, op_code
 
 @define
 class MongoSocket:
     reader: asyncio.StreamReader
     writer: asyncio.StreamWriter
-    serializer: Serializer = Serializer()
-    lock: asyncio.Lock = asyncio.Lock()
+    serializer: Serializer = field(factory=Serializer)
+    lock: asyncio.Lock = field(factory=asyncio.Lock)
 
     @classmethod
     async def make(cls, host: str, port: int) -> MongoSocket:
@@ -105,7 +125,7 @@ class MongoSocket:
             "hello": 1.0, 
             "client": {
                 "driver": {
-                    "name": "async_mongo", 
+                    "name": "amongo", 
                     "version": "0.3.2"
                 }, 
                 "os": {
@@ -130,8 +150,10 @@ class MongoSocket:
         rid, msg = self.serializer.get_message(doc, op=op)
         async with self.lock:
             await self.send(msg)
-            length, op_code = self.serializer.verify_rid(await self.recv(16), rid)
-            reply = self.serializer.get_reply(await self.recv(length - 16), op_code)
+            header = await self.recv(16)
+            length, op_code = self.serializer.verify_rid(header, rid)
+            document = await self.recv(length - 16) # exclude header
+            reply = self.serializer.get_reply(document, op_code)
         if raise_on_error:
             assert reply.get("ok") == 1.0, reply
         return reply
